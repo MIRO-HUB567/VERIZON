@@ -36,26 +36,16 @@ function validateApiKey(req, res, next) {
 }
 
 const forwardLimiter = rateLimit({
-  windowMs: 60_000, max: 30,
-  standardHeaders: true, legacyHeaders: false,
+  windowMs: 60_000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
   keyGenerator: (req) => req.headers['x-api-key'] || req.ip,
-  handler: (req, res) => { logStat(req.ip, 429, 'rate_limited'); res.status(429).json({ error: 'rate limited' }); }
+  handler: (req, res) => {
+    logStat(req.ip, 429, 'rate_limited');
+    res.status(429).json({ error: 'rate limited' });
+  }
 });
-
-const recent = new Map();
-const SPAM_WINDOW = 60_000;
-const SPAM_MAX_DUPES = 3;
-
-function antiSpam(apiKeyId, payloadStr) {
-  const h = crypto.createHash('sha256').update(payloadStr).digest('hex');
-  const now = Date.now();
-  let bucket = recent.get(apiKeyId);
-  if (!bucket) { bucket = new Map(); recent.set(apiKeyId, bucket); }
-  for (const [k, ts] of bucket) if (now - ts > SPAM_WINDOW) bucket.delete(k);
-  const count = bucket.get(h) || 0;
-  bucket.set(h, now);
-  return count >= SPAM_MAX_DUPES;
-}
 
 function validatePayload(body) {
   if (typeof body !== 'object' || body === null) return { ok: false, reason: 'not object' };
@@ -69,20 +59,39 @@ function validatePayload(body) {
 }
 
 app.post('/api/send', validateApiKey, forwardLimiter, async (req, res) => {
-  if (isKilled()) { logStat(req.ip, 503, 'killed'); return res.status(503).json({ error: 'forwarding disabled' }); }
-  const payloadStr = JSON.stringify(req.body);
-  if (antiSpam(req.apiKeyId, payloadStr)) { logStat(req.ip, 429, 'spam_dupe'); return res.status(429).json({ error: 'duplicate payload cooldown' }); }
+  if (isKilled()) {
+    logStat(req.ip, 503, 'killed');
+    return res.status(503).json({ error: 'forwarding disabled' });
+  }
   const v = validatePayload(req.body);
-  if (!v.ok) { logStat(req.ip, 400, 'invalid:' + v.reason); return res.status(400).json({ error: 'invalid payload: ' + v.reason }); }
+  if (!v.ok) {
+    logStat(req.ip, 400, 'invalid:' + v.reason);
+    return res.status(400).json({ error: 'invalid payload: ' + v.reason });
+  }
+
   const webhook = getWebhook();
-  if (!webhook) { logStat(req.ip, 500, 'no_webhook'); return res.status(500).json({ error: 'webhook not configured' }); }
+  if (!webhook) {
+    logStat(req.ip, 500, 'no_webhook');
+    return res.status(500).json({ error: 'webhook not configured' });
+  }
+
   try {
-    const r = await fetch(webhook, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(v.value) });
+    const r = await fetch(webhook, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(v.value)
+    });
     logStat(req.ip, r.status, r.ok ? 'forwarded' : 'discord_error');
-    if (r.status === 429) { const retry = r.headers.get('retry-after') || '1'; return res.status(429).json({ error: 'discord rate limit', retry_after: retry }); }
+    if (r.status === 429) {
+      const retry = r.headers.get('retry-after') || '1';
+      return res.status(429).json({ error: 'discord rate limit', retry_after: retry });
+    }
     if (!r.ok) return res.status(502).json({ error: 'discord rejected', status: r.status });
     return res.json({ ok: true });
-  } catch (e) { logStat(req.ip, 500, 'fetch_fail'); return res.status(502).json({ error: 'forward failed' }); }
+  } catch (e) {
+    logStat(req.ip, 500, 'fetch_fail');
+    return res.status(502).json({ error: 'forward failed' });
+  }
 });
 
 function requireAdmin(req, res, next) {
@@ -94,19 +103,25 @@ function requireAdmin(req, res, next) {
 app.get('/api/health', requireAdmin, async (req, res) => {
   const webhook = getWebhook();
   if (!webhook) return res.json({ status: 'unconfigured' });
-  try { const r = await fetch(webhook, { method: 'GET' }); res.json({ status: r.ok ? 'healthy' : 'degraded', http: r.status }); }
-  catch { res.json({ status: 'unreachable' }); }
+  try {
+    const r = await fetch(webhook, { method: 'GET' });
+    res.json({ status: r.ok ? 'healthy' : 'degraded', http: r.status });
+  } catch {
+    res.json({ status: 'unreachable' });
+  }
 });
 
 app.post('/admin/keys', requireAdmin, (req, res) => {
   const key = crypto.randomBytes(24).toString('hex');
   const label = String(req.body?.label || 'default').slice(0, 64);
-  db.prepare('INSERT INTO api_keys(key_hash,label,created_at) VALUES(?,?,?)').run(hashKey(key), label, Date.now());
+  db.prepare('INSERT INTO api_keys(key_hash,label,created_at) VALUES(?,?,?)')
+    .run(hashKey(key), label, Date.now());
   res.json({ key, label, note: 'store this now — only the hash is kept' });
 });
 
 app.get('/admin/keys', requireAdmin, (req, res) => {
-  res.json(db.prepare('SELECT id,label,created_at,revoked FROM api_keys ORDER BY id DESC').all());
+  const rows = db.prepare('SELECT id,label,created_at,revoked FROM api_keys ORDER BY id DESC').all();
+  res.json(rows);
 });
 
 app.post('/admin/keys/:id/revoke', requireAdmin, (req, res) => {
@@ -124,7 +139,9 @@ app.get('/admin/stats', requireAdmin, (req, res) => {
 
 app.post('/admin/rotate', requireAdmin, (req, res) => {
   const url = String(req.body?.webhook || '').trim();
-  if (!/^https:\/\/discord(app)?\.com\/api\/webhooks\//.test(url)) return res.status(400).json({ error: 'not a discord webhook url' });
+  if (!/^https:\/\/discord(app)?\.com\/api\/webhooks\//.test(url)) {
+    return res.status(400).json({ error: 'not a discord webhook url' });
+  }
   setConfig('webhook_enc', encrypt(url));
   logStat(req.ip, 200, 'rotated');
   res.json({ ok: true });
@@ -136,4 +153,7 @@ app.post('/admin/kill', requireAdmin, (req, res) => {
 });
 
 app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'public', 'admin.html')));
-app.listen(process.env.PORT || 8080, () => console.log('protector up on :' + (process.env.PORT || 8080)));
+
+app.listen(process.env.PORT || 8080, () => {
+  console.log('protector up on :' + (process.env.PORT || 8080));
+});
