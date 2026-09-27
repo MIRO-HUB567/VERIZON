@@ -25,6 +25,7 @@ const getWebhook = () => {
 };
 const isKilled = () => getConfig('kill_switch') === 'on';
 const hashKey = (k) => crypto.createHash('sha256').update(k).digest('hex');
+const forwardRateLimit = Number.parseInt(process.env.FORWARD_RATE_LIMIT || '120', 10);
 
 function validateApiKey(req, res, next) {
   const key = req.headers['x-api-key'];
@@ -37,13 +38,17 @@ function validateApiKey(req, res, next) {
 
 const forwardLimiter = rateLimit({
   windowMs: 60_000,
-  max: 30,
+  max: Number.isFinite(forwardRateLimit) && forwardRateLimit > 0 ? forwardRateLimit : 120,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => req.headers['x-api-key'] || req.ip,
+  keyGenerator: (req) => String(req.apiKeyId),
   handler: (req, res) => {
-    logStat(req.ip, 429, 'rate_limited');
-    res.status(429).json({ error: 'rate limited' });
+    logStat(req.ip, 429, 'rate_limited_local');
+    res.status(429).json({
+      error: 'local rate limit',
+      source: 'protector',
+      retry_after: res.getHeader('Retry-After') || '60'
+    });
   }
 });
 
@@ -56,6 +61,29 @@ function validatePayload(body) {
   if (Array.isArray(body.embeds)) out.embeds = body.embeds.slice(0, 10);
   if (!out.content && !out.embeds) return { ok: false, reason: 'empty' };
   return { ok: true, value: out };
+}
+
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function postWebhook(webhook, payload) {
+  let retryAfter = 1;
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const response = await fetch(webhook, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    if (response.status !== 429) return { response, retryAfter: null };
+
+    const body = await response.json().catch(() => null);
+    retryAfter = Number(body?.retry_after ?? response.headers.get('retry-after') ?? 1);
+    if (!Number.isFinite(retryAfter) || retryAfter < 0) retryAfter = 1;
+    if (attempt < 2) await wait(Math.min(Math.max(retryAfter, 0.05), 10) * 1000);
+  }
+
+  return { response: null, retryAfter };
 }
 
 app.post('/api/send', validateApiKey, forwardLimiter, async (req, res) => {
@@ -76,16 +104,12 @@ app.post('/api/send', validateApiKey, forwardLimiter, async (req, res) => {
   }
 
   try {
-    const r = await fetch(webhook, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(v.value)
-    });
-    logStat(req.ip, r.status, r.ok ? 'forwarded' : 'discord_error');
-    if (r.status === 429) {
-      const retry = r.headers.get('retry-after') || '1';
-      return res.status(429).json({ error: 'discord rate limit', retry_after: retry });
+    const { response: r, retryAfter } = await postWebhook(webhook, v.value);
+    if (!r) {
+      logStat(req.ip, 429, 'rate_limited_discord');
+      return res.status(429).json({ error: 'discord rate limit', source: 'discord', retry_after: retryAfter });
     }
+    logStat(req.ip, r.status, r.ok ? 'forwarded' : 'discord_error');
     if (!r.ok) return res.status(502).json({ error: 'discord rejected', status: r.status });
     return res.json({ ok: true });
   } catch (e) {
@@ -108,6 +132,28 @@ app.get('/api/health', requireAdmin, async (req, res) => {
     res.json({ status: r.ok ? 'healthy' : 'degraded', http: r.status });
   } catch {
     res.json({ status: 'unreachable' });
+  }
+});
+
+app.post('/admin/test-webhook', requireAdmin, async (req, res) => {
+  const webhook = getWebhook();
+  if (!webhook) return res.status(400).json({ error: 'webhook not configured' });
+
+  try {
+    const { response: r, retryAfter } = await postWebhook(webhook, {
+      content: 'Webhook Protector test message'
+    });
+    if (!r) {
+      logStat(req.ip, 429, 'rate_limited_discord_admin_test');
+      return res.status(429).json({ error: 'discord rate limit', source: 'discord', retry_after: retryAfter });
+    }
+    if (!r.ok) return res.status(502).json({ error: 'discord rejected', status: r.status });
+
+    logStat(req.ip, r.status, 'admin_test_forwarded');
+    return res.json({ ok: true, status: 'test message sent' });
+  } catch {
+    logStat(req.ip, 500, 'admin_test_fetch_fail');
+    return res.status(502).json({ error: 'webhook test failed' });
   }
 });
 
