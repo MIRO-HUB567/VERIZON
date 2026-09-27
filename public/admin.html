@@ -18,6 +18,7 @@
 
 <h3>Status</h3>
 <button onclick="health()">check webhook health</button>
+<button onclick="testWebhook()">send test message</button>
 <button onclick="stats()">refresh stats</button>
 <pre id="out">idle</pre>
 
@@ -42,6 +43,7 @@ async function api(path, opts={}) {
   return r.json();
 }
 async function health(){ document.getElementById('out').textContent = JSON.stringify(await api('/api/health'), null, 2); }
+async function testWebhook(){ document.getElementById('out').textContent = JSON.stringify(await api('/admin/test-webhook', {method:'POST'}), null, 2); }
 async function stats(){ document.getElementById('out').textContent = JSON.stringify(await api('/admin/stats'), null, 2); }
 async function newKey(){ const r = await api('/admin/keys', {method:'POST', body: JSON.stringify({label:'key'})}); document.getElementById('keys').textContent = JSON.stringify(r, null, 2); }
 async function listKeys(){ document.getElementById('keys').textContent = JSON.stringify(await api('/admin/keys'), null, 2); }
