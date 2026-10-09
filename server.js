@@ -52,6 +52,21 @@ const forwardLimiter = rateLimit({
   }
 });
 
+async function getForwardLimitForKey(keyId) {
+  const id = String(keyId || '').trim();
+  if (!id) return null;
+  if (typeof forwardLimiter.getKey !== 'function') return null;
+  return forwardLimiter.getKey(id);
+}
+
+async function resetForwardLimitForKey(keyId) {
+  const id = String(keyId || '').trim();
+  if (!id) return false;
+  if (typeof forwardLimiter.resetKey !== 'function') return false;
+  await forwardLimiter.resetKey(id);
+  return true;
+}
+
 function validatePayload(body) {
   if (typeof body !== 'object' || body === null) return { ok: false, reason: 'not object' };
   const out = {};
@@ -180,7 +195,34 @@ app.get('/admin/stats', requireAdmin, (req, res) => {
   const blocked = db.prepare("SELECT COUNT(*) c FROM stats WHERE status IN (401,429,400,503)").get().c;
   const rateEvents = db.prepare("SELECT COUNT(*) c FROM stats WHERE event LIKE 'rate%'").get().c;
   const recentLog = db.prepare('SELECT ts,ip,status,event FROM stats ORDER BY id DESC LIMIT 100').all();
-  res.json({ total, blocked, rateEvents, recentLog });
+  res.json({
+    total,
+    blocked,
+    rateEvents,
+    localRateLimit: {
+      window_seconds: 60,
+      max: Number.isFinite(forwardRateLimit) && forwardRateLimit > 0 ? forwardRateLimit : 120
+    },
+    recentLog
+  });
+});
+
+app.get('/admin/rate-limit/:keyId', requireAdmin, async (req, res) => {
+  const info = await getForwardLimitForKey(req.params.keyId);
+  res.json({
+    key_id: String(req.params.keyId),
+    total_hits: info?.totalHits || 0,
+    reset_time: info?.resetTime || null
+  });
+});
+
+app.post('/admin/rate-limit/reset', requireAdmin, async (req, res) => {
+  const keyId = req.body?.key_id;
+  if (!(await resetForwardLimitForKey(keyId))) {
+    return res.status(400).json({ error: 'missing or unsupported key_id' });
+  }
+  logStat(req.ip, 200, 'local_rate_limit_reset');
+  res.json({ ok: true, key_id: String(keyId) });
 });
 
 app.post('/admin/rotate', requireAdmin, (req, res) => {
